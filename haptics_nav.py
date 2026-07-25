@@ -1,21 +1,38 @@
 """
-haptics_nav.py — three haptic encoding schemes for a navigation user study.
+Edits: gui objects (1 as human-robot team), lengthen path for proper warning time, also we can combine
+obstacle and the slight l/r signal
+
+haptics_nav.py — navigation haptic encoding for a guide-dog robot.
 
 Belt layout: 9 actuators in a single horizontal row.
   Motor IDs:  0   1   2   3   4   5   6   7   8
               ◄── LEFT ──► ◄─ CENTER ─► ◄── RIGHT ──►
 
-Encodings
----------
-spatial   : which motor group fires encodes the cue; effect is constant.
-intensity : center 3 motors (3,4,5) fire once; vibration strength = cue.
-combined  : motor location AND pattern both encode the cue (redundant).
+Signals
+-------
+start             : 1 center buzz          (motors 3-4-5, STRONG_CLICK)
+arrive            : 1 center buzz          (motors 3-4-5, STRONG_CLICK)
+turn_left         : buzz sweep → left      (motors 3→2→1→0, STRONG_CLICK)
+turn_right        : buzz sweep → right     (motors 5→6→7→8, STRONG_CLICK)
+hard_turn_left    : strong sweep → left    (motors 3→2→1→0, STRONG_CLICK)
+hard_turn_right   : strong sweep → right   (motors 5→6→7→8, STRONG_CLICK)
+slight_turn_left  : soft sweep → left      (motors 3→2→1→0, SOFT_BUMP)
+slight_turn_right : soft sweep → right     (motors 5→6→7→8, SOFT_BUMP)
+obstacle          : 1 long center buzz     (motors 3-4-5, LONG_BUZZ)
+cleared           : 2 strong center clicks (motors 3-4-5, STRONG_CLICK × 2)
+
+Pre-warning patterns (condition 2 only — same motors, lower intensity):
+  pre start/arrive  : center SOFT_BUMP
+  pre hard turn L/R : sweep SOFT_BUMP   → actual sweep STRONG_CLICK
+  pre slight turn   : single motor SOFT_BUMP → actual sweep SOFT_BUMP
+  pre obstacle      : center SOFT_BUZZ  → actual center LONG_BUZZ
+  pre cleared       : center SOFT_BUMP × 2 → actual center STRONG_CLICK × 2
 
 Usage
 -----
-python haptics_nav.py --encoding spatial
-python haptics_nav.py --encoding intensity --dry-run
-python haptics_nav.py --encoding combined        # default
+python haptics_nav.py
+python haptics_nav.py --dry-run     # GUI only, no serial
+python haptics_nav.py --port COM4
 """
 
 import argparse
@@ -24,41 +41,30 @@ import time
 import tkinter as tk
 import threading
 
-PORT  = "COM3"
-BAUD  = 9600
+PORT = "COM3"
+BAUD = 9600
 
-# Motor groups — belt runs left (0) to right (8)
 L_GRP = [0, 1, 2]
 C_GRP = [3, 4, 5]
 R_GRP = [6, 7, 8]
-ALL   = list(range(9))
-MID   = 4       # exact-center motor (used by FrequencyHaptics)
 
 SOFT_BUMP    = 22
 STRONG_CLICK = 1
-DOUBLE_CLICK = 10
-TRIPLE_CLICK = 12
-SHARP_CLICK  = 14
-PULSE        = 47
+SOFT_BUZZ    = 47   # sustained but softer than LONG_BUZZ; used as pre-obstacle warning
 LONG_BUZZ    = 58
-ALERT        = 70
 
 EFFECT_INTENSITY = {
     SOFT_BUMP:    0.25,
     STRONG_CLICK: 0.60,
-    DOUBLE_CLICK: 0.50,
-    TRIPLE_CLICK: 0.55,
-    SHARP_CLICK:  0.70,
-    PULSE:        0.45,
+    SOFT_BUZZ:    0.45,
     LONG_BUZZ:    0.85,
-    ALERT:        1.00,
 }
 
 
-# ── base class ────────────────────────────────────────────────────────
+# ── haptics ───────────────────────────────────────────────────────────────────
 
 class NavHaptics:
-    """Serial I/O + GUI callback. Subclasses define signal patterns."""
+    """Serial I/O + GUI callback. All navigation signals in one encoding."""
 
     def __init__(self, port=PORT, on_motor=None, dry_run=False):
         self._on_motor = on_motor
@@ -76,23 +82,26 @@ class NavHaptics:
             time.sleep(0.15)
             self._ser.read_all()
         else:
-            time.sleep(0.15)
+            time.sleep(0.06)
         if self._on_motor:
             self._on_motor(motor, EFFECT_INTENSITY.get(effect, 0.5))
 
-    def _play_all(self, effect: int):
-        """Send all 9 motor commands back-to-back (no inter-command sleep) so they
-        trigger as close to simultaneously as the serial link allows, then wait once."""
+    def _play_center(self, effect: int):
+        """Fire motors 3-4-5 simultaneously."""
         if not self._dry_run:
-            for m in ALL:
+            for m in C_GRP:
                 self._ser.write(f"{m}:{effect}\n".encode())
             time.sleep(0.15)
             self._ser.read_all()
         else:
-            time.sleep(0.15)
+            time.sleep(0.06)
         if self._on_motor:
-            for m in ALL:
+            for m in C_GRP:
                 self._on_motor(m, EFFECT_INTENSITY.get(effect, 0.5))
+
+    def _sweep(self, motors: list, effect: int):
+        for m in motors:
+            self._play(m, effect)
 
     def _pause(self, s: float):
         time.sleep(s)
@@ -101,201 +110,144 @@ class NavHaptics:
         if not self._dry_run:
             self._ser.close()
 
+    # ── signals ───────────────────────────────────────────────────────────────
 
-# ── encoding 1: spatial ───────────────────────────────────────────────
+    def start(self):
+        """1 center buzz."""
+        self._play_center(STRONG_CLICK)
 
-class SpatialHaptics(NavHaptics):
-    """
-    SPATIAL — which motor group fires encodes the cue.
-    Effect (STRONG_CLICK) is identical for all signals; only location varies.
-
-    turn_left  → L group, inward-to-outward sweep (2→1→0) ×1
-    turn_right → R group, inward-to-outward sweep (6→7→8) ×1
-    obstacle   → C group, (3→4→5) ×1
-    cleared    → all 9, STRONG_CLICK L→R
-    starting   → full L→R wave (0→…→8)
-    arriving   → edges-to-center converge (0,8 → 1,7 → … → 4)
-    """
-
-    def turn_left(self):
-        for m in [2, 1, 0]:
-            self._play(m, STRONG_CLICK)
-
-    def turn_right(self):
-        for m in [6, 7, 8]:
-            self._play(m, STRONG_CLICK)
+    def arrive(self):
+        """1 center buzz."""
+        self._play_center(STRONG_CLICK)
 
     def obstacle(self):
-        for m in C_GRP:
-            self._play(m, STRONG_CLICK)
+        """1 long center buzz."""
+        self._play_center(LONG_BUZZ)
 
     def cleared(self):
-        for m in ALL:
-            self._play(m, STRONG_CLICK)
-
-    def starting(self):
-        for m in ALL:
-            self._play(m, STRONG_CLICK)
-
-    def arriving(self):
-        for m in [0, 8, 1, 7, 2, 6, 3, 5, 4]:
-            self._play(m, STRONG_CLICK)
-
-
-# ── encoding 2: intensity ─────────────────────────────────────────────
-
-class IntensityHaptics(NavHaptics):
-    """
-    INTENSITY — center 3 motors (3, 4, 5) always fire simultaneously, exactly once.
-    No spatial or frequency variation; only vibration strength differs per cue.
-
-    starting   → SOFT_BUMP    (weakest)
-    cleared    → PULSE        (low-medium)
-    turn_left  → STRONG_CLICK (medium)
-    turn_right → SHARP_CLICK  (medium-strong)
-    arriving   → LONG_BUZZ    (strong)
-    obstacle   → ALERT        (strongest)
-    """
-
-    def _m(self, effect):
-        """Fire C_GRP (3,4,5) simultaneously — burst send, one wait."""
-        if not self._dry_run:
-            for m in C_GRP:
-                self._ser.write(f"{m}:{effect}\n".encode())
-            time.sleep(0.15)
-            self._ser.read_all()
-        else:
-            time.sleep(0.15)
-        if self._on_motor:
-            for m in C_GRP:
-                self._on_motor(m, EFFECT_INTENSITY.get(effect, 0.5))
+        """2 strong center clicks."""
+        self._play_center(STRONG_CLICK)
+        self._pause(0.35)
+        self._play_center(STRONG_CLICK)
 
     def turn_left(self):
-        self._m(STRONG_CLICK)
+        """Normal buzz sweep toward left."""
+        self._sweep([3, 2, 1, 0], STRONG_CLICK)
 
     def turn_right(self):
-        self._m(SHARP_CLICK)
+        """Normal buzz sweep toward right."""
+        self._sweep([5, 6, 7, 8], STRONG_CLICK)
 
-    def obstacle(self):
-        self._m(ALERT)
+    def hard_turn_left(self):
+        """Strong sweep toward left."""
+        self._sweep([3, 2, 1, 0], STRONG_CLICK)
 
-    def cleared(self):
-        self._m(PULSE)
+    def hard_turn_right(self):
+        """Strong sweep toward right."""
+        self._sweep([5, 6, 7, 8], STRONG_CLICK)
 
-    def starting(self):
-        self._m(SOFT_BUMP)
+    def slight_turn_left(self):
+        """Soft buzz sweep toward left."""
+        self._sweep([3, 2, 1, 0], SOFT_BUMP)
 
-    def arriving(self):
-        self._m(LONG_BUZZ)
+    def slight_turn_right(self):
+        """Soft buzz sweep toward right."""
+        self._sweep([5, 6, 7, 8], SOFT_BUMP)
 
+    # ── pre-warning signals (same pattern, lower intensity) ───────────────────
 
-# ── encoding 3: combined ──────────────────────────────────────────────
+    def pre_start(self):
+        self._play_center(SOFT_BUMP)
 
-class CombinedHaptics(NavHaptics):
-    """
-    COMBINED — motor location AND temporal pattern both encode the cue.
+    def pre_arrive(self):
+        self._play_center(SOFT_BUMP)
 
-    turn_left  → L group, sweep ×2  (left + count-2)
-    turn_right → R group, sweep ×3  (right + count-3)
-    obstacle   → C group, escalating soft→strong→buzz  (center + intensity)
-    cleared    → all 9, soft spread
-    starting   → full L→R wave
-    arriving   → edges-to-center converge + long buzz
-    """
+    def pre_obstacle(self):
+        """Soft long buzz — softer than LONG_BUZZ actual."""
+        self._play_center(SOFT_BUZZ)
 
-    def turn_left(self):
-        for _ in range(2):
-            for m in [2, 1, 0]:
-                self._play(m, SHARP_CLICK)
-            self._pause(0.20)
+    def pre_cleared(self):
+        """2× soft center clicks — softer than 2× STRONG_CLICK actual."""
+        self._play_center(SOFT_BUMP)
+        self._pause(0.35)
+        self._play_center(SOFT_BUMP)
 
-    def turn_right(self):
-        for _ in range(3):
-            for m in [6, 7, 8]:
-                self._play(m, SHARP_CLICK)
-            self._pause(0.15)
+    def pre_hard_turn_left(self):
+        """Soft sweep — softer than STRONG_CLICK actual."""
+        self._sweep([3, 2, 1, 0], SOFT_BUMP)
 
-    def obstacle(self):
-        for m in C_GRP:
-            self._play(m, SOFT_BUMP)
-        self._pause(0.15)
-        for m in C_GRP:
-            self._play(m, STRONG_CLICK)
-        self._pause(0.15)
-        for m in C_GRP:
-            self._play(m, LONG_BUZZ)
+    def pre_hard_turn_right(self):
+        self._sweep([5, 6, 7, 8], SOFT_BUMP)
 
-    def cleared(self):
-        for m in ALL:
-            self._play(m, SOFT_BUMP)
+    def pre_slight_turn_left(self):
+        """Single center-left motor — softer than SOFT_BUMP sweep actual."""
+        self._play(3, SOFT_BUMP)
 
-    def starting(self):
-        for m in ALL:
-            self._play(m, STRONG_CLICK)
-
-    def arriving(self):
-        for m in [0, 8, 1, 7, 2, 6, 3, 5, 4]:
-            self._play(m, TRIPLE_CLICK)
-        self._pause(0.30)
-        for m in ALL:
-            self._play(m, LONG_BUZZ)
+    def pre_slight_turn_right(self):
+        self._play(5, SOFT_BUMP)
 
 
-ENCODINGS = {
-    'spatial':   SpatialHaptics,
-    'intensity': IntensityHaptics,
-    'combined':  CombinedHaptics,
-}
-
-ENCODING_DESC = {
-    'spatial':   'Spatial — motor location = cue',
-    'intensity': 'Intensity — vibration strength = cue  (motors 3-4-5)',
-    'combined':  'Combined — location + pattern = cue',
-}
-
-
-# ── GUI ───────────────────────────────────────────────────────────────
+# ── GUI ───────────────────────────────────────────────────────────────────────
 
 class NavGUI:
     MAP_W, MAP_H = 360, 440
     BAR_W, BAR_H = 30, 200
 
     _PATH = [
-        (180, 420), (180, 360), (180, 295),
-        (130, 240), (85,  195), (80,  145),
-        (115, 90),  (165, 50),  (195, 25),
+        (255, 425),  # S  — bottom right
+        (255, 340),  # hallway 1 (going up)
+        (255, 250),
+        (255, 237),  # hard left turn — clustered for sharp corner
+        (244, 228),
+        (228, 225),
+        (190, 224),  # hallway 2 (going left)
+        (130, 224),
+        (90,  224),
+        (78,  217),  # hard right turn — clustered for sharp corner
+        (68,  204),
+        (66,  188),
+        (66,  110),  # hallway 3 (going up)
+        (66,   25),  # ★ — top left
     ]
 
-    # Group metadata (name, motor ids, header color, bar color)
+    # (cx, cy, avoidance label)
+    # hallway 1 obstacle is right of path → slight left
+    # hallway 2 obstacle is above path   → slight right (curves below)
+    # hallway 3 obstacle is left of path → slight right
+    _OBSTACLES = [
+        (278, 325, 'slight L'),
+        (158, 207, 'slight R'),
+        (46,  118, 'slight R'),
+    ]
+
     _GROUPS = [
         ('LEFT',   L_GRP, '#42a5f5', '#1976d2'),
         ('CENTER', C_GRP, '#ffca28', '#ffa000'),
         ('RIGHT',  R_GRP, '#ef5350', '#c62828'),
     ]
 
-    def __init__(self, encoding_name: str = 'combined'):
+    def __init__(self):
         self.root = tk.Tk()
         self.root.title('NavHaptics Visualizer')
         self.root.configure(bg='#0d0d1a')
         self.root.resizable(False, False)
 
-        self._bar_val = [0.0] * 9   # one entry per motor (indexed by motor ID)
-        self._bars    = [None] * 9  # (canvas, fill_id) per motor
+        self._bar_val = [0.0] * 9
+        self._bars    = [None] * 9
         self._robot_t = 0.0
         self._status  = tk.StringVar(value='Idle')
         self._running = True
-        self._enc     = encoding_name
 
         self._build()
         self._tick()
 
-    # ── layout ────────────────────────────────────────────────────────
+    # ── layout ────────────────────────────────────────────────────────────────
 
     def _build(self):
         outer = tk.Frame(self.root, bg='#0d0d1a')
         outer.pack(padx=14, pady=14)
 
-        # ── left: map ──
+        # left: map
         map_col = tk.Frame(outer, bg='#0d0d1a')
         map_col.pack(side=tk.LEFT, padx=(0, 18))
 
@@ -310,20 +262,13 @@ class NavGUI:
         self._draw_map()
         self._update_entities()
 
-        # ── right: bars ──
+        # right: bars
         bar_col = tk.Frame(outer, bg='#0d0d1a')
         bar_col.pack(side=tk.RIGHT, anchor=tk.N)
 
         tk.Label(bar_col, text='Haptic Belt  (9 motors)',
                   fg='white', bg='#0d0d1a',
-                  font=('Helvetica', 12, 'bold')).pack(pady=(0, 3))
-
-        enc_clr = {'spatial': '#42a5f5', 'frequency': '#ffca28', 'combined': '#81c784'}
-        tk.Label(bar_col,
-                  text=ENCODING_DESC.get(self._enc, self._enc),
-                  fg=enc_clr.get(self._enc, '#aaa'),
-                  bg='#0d0d1a', font=('Helvetica', 8, 'italic'),
-                  wraplength=280).pack(pady=(0, 10))
+                  font=('Helvetica', 12, 'bold')).pack(pady=(0, 10))
 
         groups_row = tk.Frame(bar_col, bg='#0d0d1a')
         groups_row.pack()
@@ -349,7 +294,6 @@ class NavGUI:
                                highlightbackground='#2a2a50')
                 c.pack()
 
-                # Tick marks
                 for pct in (25, 50, 75):
                     y = self.BAR_H - 2 - int(pct / 100 * (self.BAR_H - 4))
                     c.create_line(2, y, self.BAR_W - 2, y, fill='#2a2a50', width=1)
@@ -364,15 +308,31 @@ class NavGUI:
 
                 self._bars[mid] = (c, fill_id)
 
-        # Belt position diagram (thin strip below bars)
-        belt_canvas = tk.Canvas(bar_col, width=self.BAR_W * 9 + 60,
-                                 height=24, bg='#0d0d1a', highlightthickness=0)
-        belt_canvas.pack(pady=(8, 0))
-        belt_canvas.create_text(self.BAR_W * 9 // 2 + 30, 12,
-                                  text='◄  belt  ►', fill='#445',
-                                  font=('Helvetica', 9))
+        # signal legend
+        legend = tk.Frame(bar_col, bg='#0d0d1a')
+        legend.pack(pady=(14, 0), anchor=tk.W)
 
-    # ── map ───────────────────────────────────────────────────────────
+        tk.Label(legend, text='Signals', fg='#aaa', bg='#0d0d1a',
+                  font=('Helvetica', 9, 'bold')).grid(row=0, column=0, columnspan=2,
+                                                       sticky='w', pady=(0, 4))
+
+        entries = [
+            ('Start / Arrive',      '1× center  STRONG'),
+            ('Turn L / R',          'sweep center→edge  STRONG'),
+            ('Hard Turn L / R',     'sweep center→edge  INTENSE'),
+            ('Slight Turn L / R',   'sweep center→edge  SOFT'),
+            ('Obstacle',            '1× center  LONG'),
+            ('Cleared',             '2× center  LONG'),
+        ]
+        for r, (name, desc) in enumerate(entries, start=1):
+            tk.Label(legend, text=name, fg='#ccc', bg='#0d0d1a',
+                      font=('Helvetica', 8, 'bold'), anchor='w').grid(
+                          row=r, column=0, sticky='w', padx=(0, 8))
+            tk.Label(legend, text=desc, fg='#666', bg='#0d0d1a',
+                      font=('Helvetica', 8), anchor='w').grid(
+                          row=r, column=1, sticky='w')
+
+    # ── map ───────────────────────────────────────────────────────────────────
 
     def _draw_map(self):
         pts  = self._PATH
@@ -394,6 +354,18 @@ class NavGUI:
         self._map.create_text(dx, dy, text='★', fill='#c8e6c9',
                                font=('Helvetica', 11))
 
+        self._draw_obstacles()
+
+    def _draw_obstacles(self):
+        for cx, cy, label in self._OBSTACLES:
+            r = 13
+            self._map.create_rectangle(cx-r, cy-r, cx+r, cy+r,
+                                        fill='#b71c1c', outline='#ff5252', width=2)
+            self._map.create_text(cx, cy, text='!', fill='white',
+                                   font=('Helvetica', 11, 'bold'))
+            self._map.create_text(cx, cy + r + 9, text=label, fill='#ff8a80',
+                                   font=('Helvetica', 7))
+
     def _path_pos(self, t: float):
         pts = self._PATH
         n   = len(pts) - 1
@@ -404,31 +376,31 @@ class NavGUI:
 
     def _update_entities(self):
         rx, ry = self._path_pos(self._robot_t)
-        px, py = self._path_pos(max(0.0, self._robot_t - 0.10))
-        self._draw_person(px, py)
+        px, py = self._path_pos(max(0.0, self._robot_t - 0.03))
         self._draw_dog(rx, ry)
+        self._draw_person(px, py)
 
     def _draw_dog(self, x, y):
         self._map.delete('dog')
-        self._map.create_oval(x-12, y-7, x+12, y+7,
+        self._map.create_oval(x-12, y-7,  x+12, y+7,
                                fill='#1565c0', outline='#90caf9', width=1.5, tags='dog')
-        self._map.create_oval(x+8, y-8, x+19, y+3,
+        self._map.create_oval(x+8,  y-8,  x+19, y+3,
                                fill='#1976d2', outline='#90caf9', width=1.5, tags='dog')
         self._map.create_oval(x+12, y-13, x+18, y-7,
-                               fill='#0d47a1', outline='#90caf9', width=1, tags='dog')
-        self._map.create_oval(x+14, y-6, x+17, y-3,
-                               fill='white', outline='', tags='dog')
+                               fill='#0d47a1', outline='#90caf9', width=1,   tags='dog')
+        self._map.create_oval(x+14, y-6,  x+17, y-3,
+                               fill='white',  outline='',         tags='dog')
 
     def _draw_person(self, x, y):
         self._map.delete('person')
-        self._map.create_oval(x-5, y-17, x+5, y-7,
+        self._map.create_oval(x-5,  y-17, x+5,  y-7,
                                fill='#ffb74d', outline='#ffe0b2', width=1.5, tags='person')
-        self._map.create_line(x, y-7, x, y+9,    fill='#ffe0b2', width=2, tags='person')
-        self._map.create_line(x-7, y-2, x+7, y-2, fill='#ffe0b2', width=2, tags='person')
-        self._map.create_line(x, y+9, x-5, y+19,  fill='#ffe0b2', width=2, tags='person')
-        self._map.create_line(x, y+9, x+5, y+19,  fill='#ffe0b2', width=2, tags='person')
+        self._map.create_line(x,    y-7,  x,    y+9,  fill='#ffe0b2', width=2, tags='person')
+        self._map.create_line(x-7,  y-2,  x+7,  y-2,  fill='#ffe0b2', width=2, tags='person')
+        self._map.create_line(x,    y+9,  x-5,  y+19, fill='#ffe0b2', width=2, tags='person')
+        self._map.create_line(x,    y+9,  x+5,  y+19, fill='#ffe0b2', width=2, tags='person')
 
-    # ── public API ────────────────────────────────────────────────────
+    # ── public API ────────────────────────────────────────────────────────────
 
     def set_status(self, text: str):
         self.root.after(0, self._status.set, text)
@@ -448,7 +420,7 @@ class NavGUI:
 
         self.root.after(0, step, 0)
 
-    # ── tick ──────────────────────────────────────────────────────────
+    # ── tick ──────────────────────────────────────────────────────────────────
 
     def _tick(self):
         for i in range(9):
@@ -469,44 +441,90 @@ class NavGUI:
         self.root.destroy()
 
 
-# ── demo ──────────────────────────────────────────────────────────────
+# ── demo ──────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='NavHaptics user-study demo')
-    parser.add_argument('--encoding', choices=list(ENCODINGS), default='combined',
-                         help='haptic encoding scheme (default: combined)')
+    parser = argparse.ArgumentParser(description='NavHaptics demo')
+    parser.add_argument('--port', default=PORT, help='serial port (default: COM3)')
     parser.add_argument('--dry-run', action='store_true',
-                         help='skip serial connection (GUI-only)')
+                         help='skip serial connection (GUI only)')
+    parser.add_argument('--c', type=int, choices=[1, 2], default=1,
+                         help='1 = no pre-warning  2 = with pre-warning (default: 1)')
     args = parser.parse_args()
 
-    gui = NavGUI(encoding_name=args.encoding)
+    gui = NavGUI()
 
     def demo():
         time.sleep(0.4)
-        HapticsClass = ENCODINGS[args.encoding]
-        print(f'\nEncoding: {ENCODING_DESC[args.encoding]}\n')
         try:
-            nav = HapticsClass(on_motor=lambda m, v: gui.flash_motor(m, v),
-                                dry_run=args.dry_run)
+            nav = NavHaptics(port=args.port,
+                              on_motor=lambda m, v: gui.flash_motor(m, v),
+                              dry_run=args.dry_run)
         except Exception as exc:
             print(f'Serial unavailable ({exc}) — switching to dry-run')
-            nav = HapticsClass(on_motor=lambda m, v: gui.flash_motor(m, v), dry_run=True)
+            nav = NavHaptics(on_motor=lambda m, v: gui.flash_motor(m, v), dry_run=True)
 
-        sequence = [
-            ('Starting',         nav.starting,  0.15),
-            ('Turn Left',        nav.turn_left,  0.42),
-            ('Turn Right',       nav.turn_right, 0.68),
-            ('Obstacle ahead',   nav.obstacle,   0.68),
-            ('Obstacle cleared', nav.cleared,    0.82),
-            ('Arriving',         nav.arriving,   1.00),
-        ]
+        PRE_GAP = 0.55  # pause between pre-warning and actual signal
 
-        for label, fn, t in sequence:
-            print(f'  >>> {label}')
-            gui.set_status(label)
-            gui.advance_path(t)
-            fn()
-            time.sleep(1.5)
+        if args.c == 1:
+            # ── Condition 1: no pre-warnings ──────────────────────────────────
+            # Signals: Start, Turn L/R, Obstacle, Arrive
+            print('\n=== Condition 1 — no pre-warning ===\n')
+            gui.set_status('Condition 1')
+            time.sleep(1.0)
+
+            sequence = [
+                ('Start',     nav.start,      0.05),
+                ('Obstacle',  nav.obstacle,   0.10),
+                ('Turn Left', nav.turn_left,  0.22),
+                ('Obstacle',  nav.obstacle,   0.40),
+                ('Turn Right',nav.turn_right, 0.58),
+                ('Obstacle',  nav.obstacle,   0.75),
+                ('Arrive',    nav.arrive,     1.00),
+            ]
+            for label, fn, t in sequence:
+                print(f'  >>> {label}')
+                gui.set_status(label)
+                gui.advance_path(t)
+                fn()
+                time.sleep(1.5)
+
+        else:
+            # ── Condition 2: with pre-warnings ────────────────────────────────
+            # Signals: Start, Hard Turn L/R, Slight Turn L/R,
+            #          Obstacle, Cleared, Arrive
+            # Each signal is preceded by the same pattern at lower intensity.
+            print('\n=== Condition 2 — with pre-warning ===\n')
+            gui.set_status('Condition 2')
+            time.sleep(1.0)
+
+            # (label, pre_fn or None, actual_fn, path_t)
+            sequence = [
+                ('Start',            nav.pre_start,             nav.start,             0.05),
+                ('Obstacle',         nav.pre_obstacle,           nav.obstacle,          0.08),
+                ('Slight Turn Left', None,                        nav.slight_turn_left,  0.11),
+                ('Cleared',          None,                        nav.cleared,           0.20),
+                ('Hard Turn Left',   nav.pre_hard_turn_left,     nav.hard_turn_left,    0.22),
+                ('Obstacle',         nav.pre_obstacle,           nav.obstacle,          0.48),
+                ('Slight Turn Left',None,                        nav.slight_turn_left, 0.50),
+                ('Cleared',          None,                        nav.cleared,           0.62),
+                ('Hard Turn Right',  nav.pre_hard_turn_right,    nav.hard_turn_right,   0.70),
+                ('Obstacle',         nav.pre_obstacle,           nav.obstacle,          0.90),
+                ('Slight Turn Right',None,                        nav.slight_turn_right, 0.95),
+                ('Cleared',          None,                        nav.cleared,           0.98),
+                ('Arrive',           nav.pre_arrive,             nav.arrive,            1.00),
+            ]
+            for label, pre_fn, fn, t in sequence:
+                gui.advance_path(t)
+                if pre_fn is not None:
+                    print(f'  >>> ⚠ pre: {label}')
+                    gui.set_status(f'⚠  {label}')
+                    pre_fn()
+                    time.sleep(PRE_GAP)
+                print(f'      → {label}')
+                gui.set_status(label)
+                fn()
+                time.sleep(1.5)
 
         gui.set_status('Arrived  ✓')
         nav.close()
