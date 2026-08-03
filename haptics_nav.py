@@ -28,21 +28,30 @@ Pre-warning patterns (condition 2 only — same motors, lower intensity):
   pre obstacle      : center SOFT_BUZZ  → actual center LONG_BUZZ
   pre cleared       : center SOFT_BUMP × 2 → actual center STRONG_CLICK × 2
 
+Backends
+--------
+ble     : the nRF5340 haptic device in src/ (BLE peripheral, binary protocol).
+          Effects become one-shot PULSE commands the device times itself.
+serial  : the legacy Arduino + DRV2605 belt (ASCII "motor:effect" @ 9600).
+dry     : no hardware, GUI only.
+
 Usage
 -----
-python haptics_nav.py
-python haptics_nav.py --dry-run     # GUI only, no serial
-python haptics_nav.py --port COM4
+python haptics_nav.py                       # BLE (default)
+python haptics_nav.py --backend dry         # GUI only, no hardware
+python haptics_nav.py --backend serial --port COM4
+python haptics_nav.py --address AA:BB:CC:DD:EE:FF
 """
 
 import argparse
-import serial
 import time
 import tkinter as tk
 import threading
 
 PORT = "COM3"
 BAUD = 9600
+
+BLE_NAME = "HapticMotor"
 
 L_GRP = [0, 1, 2]
 C_GRP = [3, 4, 5]
@@ -60,44 +69,86 @@ EFFECT_INTENSITY = {
     LONG_BUZZ:    0.85,
 }
 
+# DRV2605 waveform IDs -> (on_ms, duty %) for the BLE backend. The DRV8837
+# H-bridges on the nRF5340 board have no waveform ROM, so each library effect
+# is reproduced as a one-shot pulse: clicks are short and sharp, buzzes are
+# sustained. Duty stays >= 40% because the ERMs will not spin up below that.
+EFFECT_PULSE = {
+    SOFT_BUMP:    (50,  45),
+    STRONG_CLICK: (60,  100),
+    SOFT_BUZZ:    (400, 55),
+    LONG_BUZZ:    (600, 100),
+}
+
+# Gap between consecutive motors in a sweep. The serial backend needs a long
+# gap for the Arduino round trip; BLE pulses are fire-and-forget so the gap is
+# purely perceptual (must stay above ~80ms to read as directional motion).
+SWEEP_GAP_SERIAL = 0.15
+SWEEP_GAP_BLE    = 0.12
+SWEEP_GAP_DRY    = 0.06
+
 
 # ── haptics ───────────────────────────────────────────────────────────────────
 
 class NavHaptics:
-    """Serial I/O + GUI callback. All navigation signals in one encoding."""
+    """Transport + GUI callback. All navigation signals in one encoding.
 
-    def __init__(self, port=PORT, on_motor=None, dry_run=False):
+    backend: 'ble'    -> nRF5340 haptic device (src/), binary GATT protocol
+             'serial' -> legacy Arduino + DRV2605 belt, ASCII "motor:effect"
+             'dry'    -> no hardware
+    """
+
+    def __init__(self, backend='ble', port=PORT, name=BLE_NAME, address=None,
+                 on_motor=None):
         self._on_motor = on_motor
-        self._dry_run  = dry_run
-        if not dry_run:
+        self._backend  = backend
+        self._link     = None
+        self._ser      = None
+
+        if backend == 'ble':
+            from buzzHaptics.Buzz_Haptics.haptic_ble import BleHapticLink
+            self._link = BleHapticLink(name=name, address=address).connect()
+            self._gap = SWEEP_GAP_BLE
+        elif backend == 'serial':
+            import serial
             print(f"Connecting to {port}...")
             self._ser = serial.Serial(port, BAUD, timeout=2)
             time.sleep(2)
             ready = self._ser.read_all().decode(errors="ignore").strip()
             print(f"Arduino: {ready}")
+            self._gap = SWEEP_GAP_SERIAL
+        elif backend == 'dry':
+            self._gap = SWEEP_GAP_DRY
+        else:
+            raise ValueError(f"unknown backend: {backend}")
+
+    # ── transport ─────────────────────────────────────────────────────────────
+
+    def _fire(self, motors: list, effect: int):
+        """Actuate every motor in `motors` with `effect`, then hold for one
+        sweep gap. The GUI is flashed regardless of backend."""
+        if self._backend == 'ble':
+            on_ms, duty = EFFECT_PULSE.get(effect, (100, 80))
+            self._link.pulse_many(motors, on_ms, duty)
+        elif self._backend == 'serial':
+            for m in motors:
+                self._ser.write(f"{m}:{effect}\n".encode())
+
+        time.sleep(self._gap)
+
+        if self._backend == 'serial':
+            self._ser.read_all()
+
+        if self._on_motor:
+            for m in motors:
+                self._on_motor(m, EFFECT_INTENSITY.get(effect, 0.5))
 
     def _play(self, motor: int, effect: int):
-        if not self._dry_run:
-            self._ser.write(f"{motor}:{effect}\n".encode())
-            time.sleep(0.15)
-            self._ser.read_all()
-        else:
-            time.sleep(0.06)
-        if self._on_motor:
-            self._on_motor(motor, EFFECT_INTENSITY.get(effect, 0.5))
+        self._fire([motor], effect)
 
     def _play_center(self, effect: int):
         """Fire motors 3-4-5 simultaneously."""
-        if not self._dry_run:
-            for m in C_GRP:
-                self._ser.write(f"{m}:{effect}\n".encode())
-            time.sleep(0.15)
-            self._ser.read_all()
-        else:
-            time.sleep(0.06)
-        if self._on_motor:
-            for m in C_GRP:
-                self._on_motor(m, EFFECT_INTENSITY.get(effect, 0.5))
+        self._fire(C_GRP, effect)
 
     def _sweep(self, motors: list, effect: int):
         for m in motors:
@@ -107,7 +158,9 @@ class NavHaptics:
         time.sleep(s)
 
     def close(self):
-        if not self._dry_run:
+        if self._link is not None:
+            self._link.close()
+        if self._ser is not None:
             self._ser.close()
 
     # ── signals ───────────────────────────────────────────────────────────────
@@ -445,89 +498,106 @@ class NavGUI:
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='NavHaptics demo')
+    parser.add_argument('--backend', choices=['ble', 'serial', 'dry'], default='ble',
+                         help='ble = nRF5340 haptic device, serial = Arduino belt, '
+                              'dry = GUI only (default: ble)')
+    parser.add_argument('--name', default=BLE_NAME,
+                         help=f'BLE advertised name (default: {BLE_NAME})')
+    parser.add_argument('--address', default=None,
+                         help='BLE address (overrides --name)')
     parser.add_argument('--port', default=PORT, help='serial port (default: COM3)')
     parser.add_argument('--dry-run', action='store_true',
-                         help='skip serial connection (GUI only)')
+                         help='alias for --backend dry')
     parser.add_argument('--c', type=int, choices=[1, 2], default=1,
                          help='1 = no pre-warning  2 = with pre-warning (default: 1)')
     args = parser.parse_args()
+
+    backend = 'dry' if args.dry_run else args.backend
 
     gui = NavGUI()
 
     def demo():
         time.sleep(0.4)
         try:
-            nav = NavHaptics(port=args.port,
-                              on_motor=lambda m, v: gui.flash_motor(m, v),
-                              dry_run=args.dry_run)
+            nav = NavHaptics(backend=backend, port=args.port,
+                              name=args.name, address=args.address,
+                              on_motor=lambda m, v: gui.flash_motor(m, v))
         except Exception as exc:
-            print(f'Serial unavailable ({exc}) — switching to dry-run')
-            nav = NavHaptics(on_motor=lambda m, v: gui.flash_motor(m, v), dry_run=True)
+            print(f'{backend} backend unavailable ({exc}) — switching to dry-run')
+            gui.set_status('Hardware unavailable — dry run')
+            nav = NavHaptics(backend='dry',
+                              on_motor=lambda m, v: gui.flash_motor(m, v))
 
         PRE_GAP = 0.55  # pause between pre-warning and actual signal
 
-        if args.c == 1:
-            # ── Condition 1: no pre-warnings ──────────────────────────────────
-            # Signals: Start, Turn L/R, Obstacle, Arrive
-            print('\n=== Condition 1 — no pre-warning ===\n')
-            gui.set_status('Condition 1')
-            time.sleep(1.0)
+        try:
+            if args.c == 1:
+                # ── Condition 1: no pre-warnings ──────────────────────────────
+                # Signals: Start, Turn L/R, Obstacle, Arrive
+                print('\n=== Condition 1 — no pre-warning ===\n')
+                gui.set_status('Condition 1')
+                time.sleep(1.0)
 
-            sequence = [
-                ('Start',     nav.start,      0.05),
-                ('Obstacle',  nav.obstacle,   0.10),
-                ('Turn Left', nav.turn_left,  0.22),
-                ('Obstacle',  nav.obstacle,   0.40),
-                ('Turn Right',nav.turn_right, 0.58),
-                ('Obstacle',  nav.obstacle,   0.75),
-                ('Arrive',    nav.arrive,     1.00),
-            ]
-            for label, fn, t in sequence:
-                print(f'  >>> {label}')
-                gui.set_status(label)
-                gui.advance_path(t)
-                fn()
-                time.sleep(1.5)
+                sequence = [
+                    ('Start',     nav.start,      0.05),
+                    ('Obstacle',  nav.obstacle,   0.10),
+                    ('Turn Left', nav.turn_left,  0.22),
+                    ('Obstacle',  nav.obstacle,   0.40),
+                    ('Turn Right',nav.turn_right, 0.58),
+                    ('Obstacle',  nav.obstacle,   0.75),
+                    ('Arrive',    nav.arrive,     1.00),
+                ]
+                for label, fn, t in sequence:
+                    print(f'  >>> {label}')
+                    gui.set_status(label)
+                    gui.advance_path(t)
+                    fn()
+                    time.sleep(1.5)
 
-        else:
-            # ── Condition 2: with pre-warnings ────────────────────────────────
-            # Signals: Start, Hard Turn L/R, Slight Turn L/R,
-            #          Obstacle, Cleared, Arrive
-            # Each signal is preceded by the same pattern at lower intensity.
-            print('\n=== Condition 2 — with pre-warning ===\n')
-            gui.set_status('Condition 2')
-            time.sleep(1.0)
+            else:
+                # ── Condition 2: with pre-warnings ────────────────────────────
+                # Signals: Start, Hard Turn L/R, Slight Turn L/R,
+                #          Obstacle, Cleared, Arrive
+                # Each signal is preceded by the same pattern at lower intensity.
+                print('\n=== Condition 2 — with pre-warning ===\n')
+                gui.set_status('Condition 2')
+                time.sleep(1.0)
 
-            # (label, pre_fn or None, actual_fn, path_t)
-            sequence = [
-                ('Start',            nav.pre_start,             nav.start,             0.05),
-                ('Obstacle',         nav.pre_obstacle,           nav.obstacle,          0.08),
-                ('Slight Turn Left', None,                        nav.slight_turn_left,  0.11),
-                ('Cleared',          None,                        nav.cleared,           0.20),
-                ('Hard Turn Left',   nav.pre_hard_turn_left,     nav.hard_turn_left,    0.22),
-                ('Obstacle',         nav.pre_obstacle,           nav.obstacle,          0.48),
-                ('Slight Turn Left',None,                        nav.slight_turn_left, 0.50),
-                ('Cleared',          None,                        nav.cleared,           0.62),
-                ('Hard Turn Right',  nav.pre_hard_turn_right,    nav.hard_turn_right,   0.70),
-                ('Obstacle',         nav.pre_obstacle,           nav.obstacle,          0.90),
-                ('Slight Turn Right',None,                        nav.slight_turn_right, 0.95),
-                ('Cleared',          None,                        nav.cleared,           0.98),
-                ('Arrive',           nav.pre_arrive,             nav.arrive,            1.00),
-            ]
-            for label, pre_fn, fn, t in sequence:
-                gui.advance_path(t)
-                if pre_fn is not None:
-                    print(f'  >>> ⚠ pre: {label}')
-                    gui.set_status(f'⚠  {label}')
-                    pre_fn()
-                    time.sleep(PRE_GAP)
-                print(f'      → {label}')
-                gui.set_status(label)
-                fn()
-                time.sleep(1.5)
+                # (label, pre_fn or None, actual_fn, path_t)
+                sequence = [
+                    ('Start',            nav.pre_start,             nav.start,             0.05),
+                    ('Obstacle',         nav.pre_obstacle,           nav.obstacle,          0.08),
+                    ('Slight Turn Left', None,                        nav.slight_turn_left,  0.11),
+                    ('Cleared',          None,                        nav.cleared,           0.20),
+                    ('Hard Turn Left',   nav.pre_hard_turn_left,     nav.hard_turn_left,    0.22),
+                    ('Obstacle',         nav.pre_obstacle,           nav.obstacle,          0.48),
+                    ('Slight Turn Left',None,                        nav.slight_turn_left, 0.50),
+                    ('Cleared',          None,                        nav.cleared,           0.62),
+                    ('Hard Turn Right',  nav.pre_hard_turn_right,    nav.hard_turn_right,   0.70),
+                    ('Obstacle',         nav.pre_obstacle,           nav.obstacle,          0.90),
+                    ('Slight Turn Right',None,                        nav.slight_turn_right, 0.95),
+                    ('Cleared',          None,                        nav.cleared,           0.98),
+                    ('Arrive',           nav.pre_arrive,             nav.arrive,            1.00),
+                ]
+                for label, pre_fn, fn, t in sequence:
+                    gui.advance_path(t)
+                    if pre_fn is not None:
+                        print(f'  >>> ⚠ pre: {label}')
+                        gui.set_status(f'⚠  {label}')
+                        pre_fn()
+                        time.sleep(PRE_GAP)
+                    print(f'      → {label}')
+                    gui.set_status(label)
+                    fn()
+                    time.sleep(1.5)
 
-        gui.set_status('Arrived  ✓')
-        nav.close()
+            gui.set_status('Arrived  ✓')
+        except Exception as exc:
+            # A mid-run disconnect must not leave motors latched on.
+            print(f'[ERROR] run aborted: {exc}')
+            gui.set_status(f'Aborted: {exc}')
+        finally:
+            nav.close()
 
     threading.Thread(target=demo, daemon=True).start()
     gui.run()
