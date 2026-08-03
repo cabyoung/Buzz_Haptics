@@ -19,3 +19,6 @@ python .\haptics_nav.py --backend ble --c 2
 python haptics_nav.py --backend dry          
 ```
 
+Note: to test if every motor is working via BLE, run `python haptic_ble.py`.
+
+Note: to run the CLI console, just run `python haptic_cli.py`. 
