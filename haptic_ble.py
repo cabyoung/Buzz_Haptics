@@ -10,7 +10,7 @@ owns an asyncio loop on a daemon thread and exposes plain blocking methods.
 Two translations happen here, because the belt script and the firmware do not
 share a vocabulary:
 
-  belt index -> motor id   The script numbers motors 0-8; the firmware numbers
+  belt index -> motor id   The script numbers motors 0-5; the firmware numbers
                            them 1-10 (schematic labels DRV_1..DRV_10) and
                            treats id 0 as "default motor". Offset by +1.
 
@@ -27,6 +27,7 @@ Standalone smoke test:
 import asyncio
 import struct
 import threading
+import time
 
 from bleak import BleakClient, BleakScanner
 
@@ -41,9 +42,9 @@ OP_OFF     = 0x00
 OP_PULSE   = 0x04
 OP_SETFREQ = 0x05
 
-# Belt index 0-8 maps onto firmware motor ids 1-9 (DRV_10 is left unused).
+# Belt index 0-5 maps onto firmware motor ids 1-6 (DRV_7..DRV_10 unused).
 MOTOR_ID_OFFSET = 1
-BELT_SIZE       = 9
+BELT_SIZE       = 6
 
 # PWM carrier pushed to the device on connect. 25 kHz keeps the H-bridge
 # switching above the audible band so the belt is silent between pulses.
@@ -51,7 +52,7 @@ PWM_CARRIER_HZ = 25000
 
 
 def belt_to_motor_id(index: int) -> int:
-    """Belt position 0-8 -> firmware motor id 1-9."""
+    """Belt position 0-5 -> firmware motor id 1-6."""
     return index + MOTOR_ID_OFFSET
 
 
@@ -105,17 +106,35 @@ class BleHapticLink:
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
-    def connect(self):
-        """Scan, connect, subscribe to status. Raises on failure."""
+    def connect(self, attempts=3, backoff=2.0):
+        """Scan, connect, subscribe to status. Raises on failure.
+
+        A peripheral that drops the link immediately after connecting is the
+        common failure here, and it is usually transient, so a failed attempt
+        is torn down and retried rather than reported straight away."""
         self._loop   = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
         self._thread.start()
-        try:
-            self._run(self._connect())
-        except Exception:
-            self._shutdown_loop()
-            raise
-        return self
+
+        last = None
+        for attempt in range(1, attempts + 1):
+            try:
+                self._run(self._connect())
+                return self
+            except Exception as exc:
+                last = exc
+                print(f'[BLE] attempt {attempt}/{attempts} failed: {exc}')
+                try:
+                    self._run(self._disconnect(), timeout=10.0)
+                except Exception:
+                    pass
+                self._client = None
+                if attempt < attempts:
+                    print(f'[BLE] retrying in {backoff:g} s ...')
+                    time.sleep(backoff)
+
+        self._shutdown_loop()
+        raise last
 
     def close(self):
         """Stop every motor, disconnect, and tear the loop down."""
@@ -197,6 +216,15 @@ class BleHapticLink:
         except Exception as exc:
             print(f"[BLE] Status notify unavailable: {exc}")
 
+        # A peripheral that drops the link right after connecting shows up as a
+        # failure on whatever operation happens to be in flight, which makes
+        # the notify warning above look like the cause. Say what it really is.
+        if not client.is_connected:
+            raise RuntimeError(
+                "device dropped the connection immediately after connecting - "
+                "power-cycle the belt, and if Windows has it paired, remove it "
+                "under Settings > Bluetooth so the cached GATT table is dropped")
+
         await self._write(enc_freq(PWM_CARRIER_HZ))
 
     async def _disconnect(self):
@@ -245,14 +273,20 @@ if __name__ == "__main__":
     link = BleHapticLink(name=args.name, address=args.address,
                          on_status=lambda d: print(f"[STATUS] duty={d}%")).connect()
     try:
-        print("Sweeping belt 0 -> 8 ...")
+        print(f"Sweeping belt 1 -> {BELT_SIZE} ...")
         for i in range(BELT_SIZE):
-            print(f"  motor {i} (firmware id {belt_to_motor_id(i)})")
+            print(f"  motor {i + 1} (firmware id {belt_to_motor_id(i)})")
             link.pulse(i, 200, 100)
             time.sleep(0.35)
 
-        print("Center group 3-4-5 together ...")
-        link.pulse_many([3, 4, 5], 500, 100)
+        # All six at once is what obstacle and arrive actually do, and it is
+        # the worst case for the supply: if the rail cannot hold up, this is
+        # the step that drops the link.
+        print(f"All {BELT_SIZE} together ...")
+        link.pulse_many(list(range(BELT_SIZE)), 500, 100)
         time.sleep(1.0)
+
+        print("Still connected." if link.connected else
+              "DISCONNECTED - the belt dropped under load, see ble_uptime.py --ramp")
     finally:
         link.close()
